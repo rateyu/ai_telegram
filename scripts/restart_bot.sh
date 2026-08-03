@@ -1,19 +1,25 @@
 #!/bin/zsh
 set -euo pipefail
 
-PROJECT_DIR="/Users/myu/github/ai_telegram"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
 PYTHON="$PROJECT_DIR/.venv/bin/python"
 BOT="$PROJECT_DIR/bot.py"
 LOG="$PROJECT_DIR/bot.log"
 PID_FILE="$PROJECT_DIR/bot.pid"
 LABEL="com.myu.ai-telegram-bot"
-PLIST="$PROJECT_DIR/scripts/$LABEL.plist"
+PLIST_TEMPLATE="$PROJECT_DIR/scripts/$LABEL.plist"
+RUNTIME_PLIST="/tmp/${LABEL}.plist"
 DOMAIN="gui/$(id -u)"
 
 cd "$PROJECT_DIR"
 
 echo "Stopping existing bot.py processes for $PROJECT_DIR ..."
 launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1 || true
+
+# Dynamically generate runtime plist with current PROJECT_DIR
+sed "s|/Users/myu/github/ai_telegram|$PROJECT_DIR|g" "$PLIST_TEMPLATE" > "$RUNTIME_PLIST"
 
 pids=()
 while IFS= read -r line; do
@@ -46,7 +52,7 @@ fi
 echo "Starting bot.py ..."
 touch "$LOG"
 start_line_count="$(wc -l < "$LOG" | tr -d ' ')"
-launchctl bootstrap "$DOMAIN" "$PLIST"
+launchctl bootstrap "$DOMAIN" "$RUNTIME_PLIST"
 launchctl kickstart -k "$DOMAIN/$LABEL"
 
 for _ in {1..45}; do
