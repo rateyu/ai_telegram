@@ -1,22 +1,28 @@
 import asyncio
+import json
 import logging
 import os
 import re
+import sys
+import time
+import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ChatType
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
 
+import tools as hm_tools
 
 load_dotenv()
 
@@ -53,6 +59,26 @@ class Settings:
     max_model_tokens: int | None
     request_retries: int
     retry_backoff_seconds: float
+    admin_user_ids: frozenset[int]
+    hm_script_path: str
+    hm_python_bin: str
+    hm_machines_config: str
+    hm_command_timeout_seconds: float
+
+
+def parse_admin_ids(value: str | None) -> frozenset[int]:
+    if not value or not value.strip():
+        return frozenset()
+    ids: set[int] = set()
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            logging.getLogger("telegram-litellm-bot").warning("Ignoring invalid admin id: %r", part)
+    return frozenset(ids)
 
 
 def load_settings() -> Settings:
@@ -76,6 +102,15 @@ def load_settings() -> Settings:
         max_model_tokens=parse_optional_int(os.getenv("MAX_MODEL_TOKENS")),
         request_retries=max(0, int(os.getenv("REQUEST_RETRIES", "2"))),
         retry_backoff_seconds=max(0.1, float(os.getenv("RETRY_BACKOFF_SECONDS", "2"))),
+        admin_user_ids=parse_admin_ids(os.getenv("TELEGRAM_ADMIN_USER_IDS")),
+        hm_script_path=os.getenv(
+            "HM_SCRIPT_PATH", "/Users/myu/github/homemachines/home_machines.py"
+        ).strip(),
+        hm_python_bin=os.getenv("HM_PYTHON_BIN", "").strip() or sys.executable,
+        hm_machines_config=os.getenv(
+            "HM_MACHINES_CONFIG", "/Users/myu/github/homemachines/machines.json"
+        ).strip(),
+        hm_command_timeout_seconds=float(os.getenv("HM_COMMAND_TIMEOUT_SECONDS", "150")),
     )
 
 
@@ -89,6 +124,68 @@ client = AsyncOpenAI(
 chat_histories: dict[int, deque[dict[str, str]]] = defaultdict(
     lambda: deque(maxlen=settings.max_history_messages)
 )
+
+tools_settings = hm_tools.ToolsSettings(
+    hm_script_path=settings.hm_script_path,
+    hm_python_bin=settings.hm_python_bin,
+    hm_command_timeout_seconds=settings.hm_command_timeout_seconds,
+    machines_config_path=settings.hm_machines_config,
+    admin_user_ids=settings.admin_user_ids,
+)
+machine_names = hm_tools.load_machine_names(settings.hm_machines_config)
+self_host_machine = hm_tools.resolve_self_host_machine(
+    settings.hm_machines_config, settings.litellm_base_url
+)
+TOOL_SCHEMA = hm_tools.build_tool_schema(machine_names)
+TOOL_USAGE_HINT = (
+    "如果用户明确要求开机/唤醒、关机/休眠，或查询某台或全部家庭电脑的在线状态，"
+    "调用 home_machine_control 工具处理；不确定意图或只是闲聊时不要调用。"
+)
+TOOL_MAX_ROUNDS = 3
+PENDING_CONFIRMATION_TTL_SECONDS = 120
+
+if not settings.admin_user_ids:
+    logging.getLogger("telegram-litellm-bot").warning(
+        "TELEGRAM_ADMIN_USER_IDS is empty; home machine power control is disabled for everyone."
+    )
+if not machine_names:
+    logging.getLogger("telegram-litellm-bot").warning(
+        "No machines loaded from %s; home machine power control tool has no valid targets.",
+        settings.hm_machines_config,
+    )
+
+
+@dataclass
+class PendingAction:
+    action: str
+    target: str
+    requester_user_id: int
+    chat_id: int
+    created_at: float
+
+
+pending_confirmations: dict[str, PendingAction] = {}
+
+
+def register_pending_confirmation(chat_id: int, requester_user_id: int, action: str, target: str) -> str:
+    token = uuid.uuid4().hex[:12]
+    pending_confirmations[token] = PendingAction(
+        action=action,
+        target=target,
+        requester_user_id=requester_user_id,
+        chat_id=chat_id,
+        created_at=time.monotonic(),
+    )
+    return token
+
+
+def pop_valid_pending(token: str) -> PendingAction | None:
+    pending = pending_confirmations.pop(token, None)
+    if pending is None:
+        return None
+    if time.monotonic() - pending.created_at > PENDING_CONFIRMATION_TTL_SECONDS:
+        return None
+    return pending
 
 
 def strip_bot_mention(text: str, bot_username: str | None) -> str:
@@ -159,7 +256,81 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/model - 查看当前 LiteLLM 连接配置\n"
         "/health - 检查 LiteLLM 模型链路\n"
         "/reset - 清空当前聊天上下文\n"
-        "/help - 查看帮助"
+        "/wake [机器名|all] - 唤醒家庭设备（仅管理员，默认 all）\n"
+        "/sleep [机器名|all] - 休眠家庭设备（仅管理员，默认 all，需二次确认）\n"
+        "/help - 查看帮助\n\n"
+        "也可以直接用自然语言让我开机/关机（比如“把电脑都叫醒”），我会按需调用同一套工具。"
+    )
+
+
+async def run_admin_machine_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, action: str
+) -> None:
+    message = update.effective_message
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    if not hm_tools.is_authorized(tools_settings, user_id):
+        await message.reply_text("你没有控制家庭设备电源的权限。")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    target = parts[1].strip() if len(parts) > 1 else "all"
+
+    if action == "sleep":
+        token = register_pending_confirmation(chat_id, user_id, action, target)
+        await send_confirmation_prompt(context, chat_id, token, action, target)
+        return
+
+    outcome = await hm_tools.dispatch_tool_call(
+        tools_settings, action, target, user_id, machine_names, self_host_machine
+    )
+    await reply_long_text(update, outcome.user_message or outcome.summary)
+
+
+async def wake_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await run_admin_machine_command(update, context, action="wake")
+
+
+async def sleep_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await run_admin_machine_command(update, context, action="sleep")
+
+
+async def handle_confirmation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    if ":" not in data:
+        return
+    kind, token = data.split(":", 1)
+
+    pending = pop_valid_pending(token)
+    if pending is None:
+        await query.edit_message_text("该确认已过期或已被处理。")
+        return
+
+    requester_id = query.from_user.id
+    if requester_id != pending.requester_user_id and requester_id not in tools_settings.admin_user_ids:
+        pending_confirmations[token] = pending  # restore for the rightful requester
+        await query.edit_message_text("只有发起者或管理员可以确认此操作。")
+        return
+
+    if kind == "hm_cancel":
+        await query.edit_message_text(f"已取消：{pending.action} {pending.target}")
+        return
+
+    await query.edit_message_text(f"正在执行：{pending.action} {pending.target} ...")
+    outcome = await hm_tools.dispatch_tool_call(
+        tools_settings,
+        pending.action,
+        pending.target,
+        pending.requester_user_id,
+        machine_names,
+        self_host_machine,
+        confirmed=True,
+    )
+    await context.bot.send_message(
+        chat_id=pending.chat_id, text=outcome.user_message or outcome.summary
     )
 
 
@@ -208,13 +379,18 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
-def build_completion_kwargs(messages: list[dict[str, str]]) -> dict[str, object]:
+def build_completion_kwargs(
+    messages: list[dict[str, str]], tools: list[dict] | None = None
+) -> dict[str, object]:
     kwargs: dict[str, object] = {
         "model": settings.litellm_model,
         "messages": messages,
     }
     if settings.max_model_tokens:
         kwargs["max_tokens"] = settings.max_model_tokens
+    if tools:
+        kwargs["tools"] = tools
+        kwargs["tool_choice"] = "auto"
     return kwargs
 
 
@@ -227,13 +403,15 @@ def should_retry_api_error(exc: APIStatusError) -> bool:
     return exc.status_code in RETRYABLE_STATUS_CODES
 
 
-async def create_chat_completion_with_retries(messages: list[dict[str, str]]):
+async def create_chat_completion_with_retries(
+    messages: list[dict[str, str]], tools: list[dict] | None = None
+):
     last_error: Exception | None = None
     attempts = settings.request_retries + 1
 
     for attempt in range(attempts):
         try:
-            return await client.chat.completions.create(**build_completion_kwargs(messages))
+            return await client.chat.completions.create(**build_completion_kwargs(messages, tools))
         except APIStatusError as exc:
             last_error = exc
             if not should_retry_api_error(exc) or attempt == attempts - 1:
@@ -256,14 +434,103 @@ async def create_chat_completion_with_retries(messages: list[dict[str, str]]):
     raise RuntimeError("LiteLLM request failed after retries")
 
 
-async def ask_litellm(chat_id: int, prompt: str) -> str:
+async def send_raw_tool_output(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
+    if not text:
+        return
+    for chunk in split_reply(text, settings.max_reply_chars):
+        await context.bot.send_message(chat_id=chat_id, text=chunk)
+
+
+async def send_confirmation_prompt(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, token: str, action: str, target: str
+) -> None:
+    action_zh = {"sleep": "休眠", "wake": "唤醒", "status": "查询状态"}.get(action, action)
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ 确认执行", callback_data=f"hm_confirm:{token}"),
+                InlineKeyboardButton("❌ 取消", callback_data=f"hm_cancel:{token}"),
+            ]
+        ]
+    )
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"即将对 {target} 执行「{action_zh}」，请确认（2 分钟内有效）：",
+        reply_markup=keyboard,
+    )
+
+
+async def run_tool_call_loop(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    telegram_user_id: int,
+    messages: list[dict[str, object]],
+) -> str | None:
+    """Run a bounded LLM tool-calling loop. Returns the final assistant text, or None if a
+    confirmation prompt was already sent to the chat and nothing more should be said.
+    """
+    for _ in range(TOOL_MAX_ROUNDS):
+        response = await create_chat_completion_with_retries(messages, tools=[TOOL_SCHEMA])
+        choice_message = response.choices[0].message
+        tool_calls = choice_message.tool_calls or []
+
+        if not tool_calls:
+            return (choice_message.content or "").strip()
+
+        messages.append(
+            {
+                "role": "assistant",
+                "content": choice_message.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                    }
+                    for tc in tool_calls
+                ],
+            }
+        )
+
+        for tc in tool_calls:
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            action = str(args.get("action", ""))
+            target = str(args.get("target", ""))
+
+            outcome = await hm_tools.dispatch_tool_call(
+                tools_settings, action, target, telegram_user_id, machine_names, self_host_machine
+            )
+
+            if outcome.needs_confirmation:
+                token = register_pending_confirmation(chat_id, telegram_user_id, action, target)
+                await send_confirmation_prompt(context, chat_id, token, action, target)
+                return None
+
+            if outcome.user_message:
+                await send_raw_tool_output(context, chat_id, outcome.user_message)
+
+            messages.append(
+                {"role": "tool", "tool_call_id": tc.id, "content": outcome.summary}
+            )
+
+    return "达到最大工具调用轮数，请重新描述你的需求。"
+
+
+async def ask_litellm(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, telegram_user_id: int, prompt: str
+) -> str | None:
     history = chat_histories[chat_id]
-    messages = [{"role": "system", "content": settings.bot_system_prompt}]
+    messages = [{"role": "system", "content": f"{settings.bot_system_prompt}\n\n{TOOL_USAGE_HINT}"}]
     messages.extend(history)
     messages.append({"role": "user", "content": prompt})
 
-    response = await create_chat_completion_with_retries(messages)
-    answer = extract_answer_content(response)
+    answer = await run_tool_call_loop(context, chat_id, telegram_user_id, messages)
+    if answer is None:
+        # A confirmation prompt was already sent; nothing more to say for this turn.
+        return None
 
     history.append({"role": "user", "content": prompt})
     history.append({"role": "assistant", "content": answer})
@@ -280,10 +547,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
     try:
-        answer = await ask_litellm(chat_id, prompt)
+        answer = await ask_litellm(context, chat_id, user_id, prompt)
     except (APITimeoutError, APIConnectionError, asyncio.TimeoutError):
         logger.exception("LiteLLM request timed out")
         await update.effective_message.reply_text(
@@ -324,6 +592,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
+    if answer is None:
+        return
+
     await reply_long_text(update, answer)
 
 
@@ -357,7 +628,12 @@ def main() -> None:
     application.add_handler(CommandHandler("model", model_command))
     application.add_handler(CommandHandler("health", health_command))
     application.add_handler(CommandHandler("reset", reset))
+    application.add_handler(CommandHandler("wake", wake_command))
+    application.add_handler(CommandHandler("sleep", sleep_command))
     application.add_handler(CommandHandler("ask", handle_message))
+    application.add_handler(
+        CallbackQueryHandler(handle_confirmation_callback, pattern=r"^hm_(confirm|cancel):")
+    )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_error_handler(error_handler)
 

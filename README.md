@@ -1,6 +1,15 @@
 # Telegram + LiteLLM 机器人
 
-一个通过已安装的 LiteLLM / OpenAI 兼容接口连接模型的 Telegram 机器人。
+一个通过已安装的 LiteLLM / OpenAI 兼容接口连接模型的 Telegram 机器人，并可通过 LLM tool-calling 或确定性命令控制家庭设备的开机/休眠。
+
+## 更新日志
+
+- 2026-08-04：新增家庭设备电源控制（wake/sleep/status），基于 `~/github/homemachines/home_machines.py`（即 `hm` 命令）。提供两条入口：
+  - LLM tool-calling：自然语言（"把电脑都叫醒" "该睡了"）由模型判断是否调用 `home_machine_control` 工具。
+  - 确定性命令：`/wake [机器名|all]`、`/sleep [机器名|all]`，不经过模型，直接执行，作为可靠兜底。
+  - 两条路径共用同一个 `tools.py::dispatch_tool_call()`，统一做管理员白名单鉴权、目标校验、`sleep` 二次确认（Telegram inline button）、审计日志。
+  - 自保护：LiteLLM/llama.cpp 后端所在的机器（当前是 `win-8`，从 `LITELLM_BASE_URL` 自动识别）会被排除在 `sleep all` 之外，且拒绝对它单独下发 `sleep`，避免模型把自己依赖的推理服务器睡了。
+  - 详见下方「家庭设备电源控制」一节。
 
 ## 运行前提
 
@@ -107,9 +116,38 @@ tail -n 120 bot.log
 - `/model` 查看当前 LiteLLM 接口地址和模型名。
 - `/health` 检查机器人到 LiteLLM 模型链路是否正常。
 - `/reset` 清空当前聊天上下文。
+- `/wake [机器名|all]` 唤醒家庭设备（仅管理员，默认 `all`）。
+- `/sleep [机器名|all]` 休眠家庭设备（仅管理员，默认 `all`，需点击确认按钮）。
 - `/help` 查看命令。
+- 也可以直接说自然语言，比如"把电脑都叫醒"，模型会按需调用同一套工具。
 
-上下文按 Telegram chat 隔离，并保存在进程内存中；重启后会清空。
+上下文按 Telegram chat 隔离，并保存在进程内存中；重启后会清空。工具调用本身（tool_calls/tool 消息）不写入长期上下文，只有最终的自然语言回复会被记住，避免 `MAX_HISTORY_MESSAGES` 截断把一次工具调用切成不完整的消息对而导致下次请求报错。
+
+## 家庭设备电源控制
+
+依赖 `~/github/homemachines/home_machines.py`（本机 `hm` 命令的实际脚本），通过 Wake-on-LAN 唤醒、SSH 执行 suspend/hibernate 休眠。机器人不会调用 `hm` 这个 shell alias（子进程环境里不存在 alias），而是直接执行脚本路径：见 `HM_SCRIPT_PATH` / `HM_PYTHON_BIN`。
+
+### 配置
+
+```env
+# 留空则彻底禁用电源控制功能（fail closed）。填你的 Telegram 数字 user id（问 @userinfobot 拿）。
+TELEGRAM_ADMIN_USER_IDS=123456789,987654321
+HM_SCRIPT_PATH=/Users/myu/github/homemachines/home_machines.py
+HM_MACHINES_CONFIG=/Users/myu/github/homemachines/machines.json
+HM_PYTHON_BIN=            # 留空则用机器人自己的 venv python（home_machines.py 只依赖标准库，够用）
+HM_COMMAND_TIMEOUT_SECONDS=150
+```
+
+### 安全设计
+
+- **鉴权在执行层，不在 prompt 里**：无论是模型主动发起的 tool_call，还是 `/wake` `/sleep` 命令，最终都进 `tools.py::dispatch_tool_call()`，在真正执行前检查 `telegram_user_id` 是否在 `TELEGRAM_ADMIN_USER_IDS` 白名单里。非管理员在群聊里让模型"帮我关机"，模型即使决定调用工具，也会被拒绝执行。
+- **目标白名单**：`target` 只接受 `machines.json` 里已存在的机器名或 `all`，不接受自由文本，杜绝模型编造机器名或注入参数。
+- **自保护**：LiteLLM 后端所在机器（自动从 `LITELLM_BASE_URL` 的 host 匹配 `machines.json` 里的 `ip`）——
+  - `sleep all` 时自动跳过它，并在结果里注明。
+  - 直接指定 `sleep <该机器>` 会被直接拒绝，因为休眠它可能在请求处理到一半时就切断机器人依赖的推理服务。这类操作需要手动处理。
+- **`sleep` 需要二次确认**：无论来自模型还是 `/sleep` 命令，都会先给出一个 inline button（"确认执行" / "取消"），2 分钟内有效，只有发起者本人或管理员可以点击确认；`wake`/`status` 无副作用风险，直接执行。
+- **审计日志**：每次工具调用（无论执行、拒绝还是待确认）都记录到 `bot.log`，包含 `telegram_user_id`、`action`、`target`、执行结果。
+- **原始输出透传**：`hm` 脚本的原始 stdout 会直接发给 Telegram 用户（而不是只让模型转述），保证"设备到底发生了什么"有可核对的真实来源。
 
 ## 常见问题
 
