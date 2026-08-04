@@ -8,7 +8,7 @@
   - LLM tool-calling：自然语言（"把电脑都叫醒" "该睡了"）由模型判断是否调用 `home_machine_control` 工具。
   - 确定性命令：`/wake [机器名|all]`、`/sleep [机器名|all]`，不经过模型，直接执行，作为可靠兜底。
   - 两条路径共用同一个 `tools.py::dispatch_tool_call()`，统一做管理员白名单鉴权、目标校验、`sleep` 二次确认（Telegram inline button）、审计日志。
-  - 自保护：LiteLLM/llama.cpp 后端所在的机器（当前是 `win-8`，从 `LITELLM_BASE_URL` 自动识别）会被排除在 `sleep all` 之外，且拒绝对它单独下发 `sleep`，避免模型把自己依赖的推理服务器睡了。
+  - 自保护：LiteLLM/llama.cpp 后端所在的机器（当前是 `win-8`，从 `LITELLM_BASE_URL` 自动识别）在 `sleep` 前会有专门提示（见下方 08-04 第二条更新，现已支持休眠它本身）。
   - 详见下方「家庭设备电源控制」一节。
   - **使用说明**：
     1. 启用前必须在 `.env` 填 `TELEGRAM_ADMIN_USER_IDS`（问 @userinfobot 拿自己的 Telegram 数字 user id），留空则功能整体禁用；改完 `.env` 用 `scripts/restart_bot.sh` 重启生效。
@@ -16,7 +16,13 @@
     3. 确定性命令方式：`/wake all`（或 `/wake win-8` 指定单台）唤醒，立即执行；`/sleep all`（或 `/sleep linux-1153`）休眠。
     4. `sleep` 无论来自自然语言还是命令，都会先收到一条带「✅ 确认执行 / ❌ 取消」按钮的消息，2 分钟内点击确认才真正执行，只有发起人本人或管理员能点；不确认会自动过期。
     5. 执行后机器人会把 `hm` 脚本的原始输出直接发回聊天（每台机器一段"成功/失败 + 详情"），可直接核对真实结果，不必只信模型的转述。
-    6. `sleep all` 时会自动跳过 LiteLLM 所在的机器并在结果里注明「已跳过」；如果确实要休眠那台机器，需要手动登录处理，机器人会拒绝这类请求。
+    6. `win-8`（LLM 推理服务所在机器）现在和其他机器一样支持 `wake`/`sleep`；对它或 `sleep all` 执行休眠时，确认按钮和执行结果里都会带一句提示：休眠后模型对话会暂时不可用，需要重新唤醒它。
+
+- 2026-08-04（续）：`win-8` 支持休眠 + LiteLLM 不可达时的关键词兜底。
+  - 不再拒绝对 `win-8` 下发 `sleep`（原先的自保护是硬拒绝）。因为 `sleep` 的确认点击本来就不经过模型（`handle_confirmation_callback` 直接执行，不需要再调一次 LLM），所以休眠它本身其实是安全的，只是会警告"休眠后模型暂时不可用"。
+  - `sleep all` 不再手动排除 `win-8`，改成把 `target="all"` 原样交给 `hm` 自己处理——这样也顺带修复了一个隐患：之前逐台循环调用会跳过 `home_machines.py` 里"先睡 jump host 后面的机器，再睡 jump host 本身"的顺序保护；现在统一交给 `hm` 一次调用，顺序由它自己保证。
+  - **关键场景**：如果 `win-8` 睡着了，LiteLLM 就连不上，模型自然也没法做 tool-calling——这时候想用自然语言让机器人"唤醒 win-8"会卡死在等模型响应。现在 `handle_message` 每次都会先用 `tools.py::is_host_reachable()` 做一次到 LiteLLM 的 TCP 探活（2 秒超时）：连不上就跳过模型，改用 `tools.py::parse_intent()` 做关键词兜底解析（"唤醒/叫醒/开机" "休眠/睡眠/关机" "状态/在线" + 机器名或"全部/都"），直接走 `dispatch_tool_call()` 执行；识别不到就提示"模型不可用，请用 /wake win-8 或说'唤醒 win-8'"。这样即使模型所在的机器睡着了，也能单靠关键词把它叫醒，不依赖它自己。
+  - 兜底解析故意保守：没匹配到明确目标就返回"未识别"而不是猜一个，避免闲聊里出现"我都不知道"之类的词被误判成 `sleep all`。
 
 ## 运行前提
 
@@ -149,10 +155,9 @@ HM_COMMAND_TIMEOUT_SECONDS=150
 
 - **鉴权在执行层，不在 prompt 里**：无论是模型主动发起的 tool_call，还是 `/wake` `/sleep` 命令，最终都进 `tools.py::dispatch_tool_call()`，在真正执行前检查 `telegram_user_id` 是否在 `TELEGRAM_ADMIN_USER_IDS` 白名单里。非管理员在群聊里让模型"帮我关机"，模型即使决定调用工具，也会被拒绝执行。
 - **目标白名单**：`target` 只接受 `machines.json` 里已存在的机器名或 `all`，不接受自由文本，杜绝模型编造机器名或注入参数。
-- **自保护**：LiteLLM 后端所在机器（自动从 `LITELLM_BASE_URL` 的 host 匹配 `machines.json` 里的 `ip`）——
-  - `sleep all` 时自动跳过它，并在结果里注明。
-  - 直接指定 `sleep <该机器>` 会被直接拒绝，因为休眠它可能在请求处理到一半时就切断机器人依赖的推理服务。这类操作需要手动处理。
-- **`sleep` 需要二次确认**：无论来自模型还是 `/sleep` 命令，都会先给出一个 inline button（"确认执行" / "取消"），2 分钟内有效，只有发起者本人或管理员可以点击确认；`wake`/`status` 无副作用风险，直接执行。
+- **`sleep` 需要二次确认**：无论来自模型、`/sleep` 命令还是关键词兜底，都会先给出一个 inline button（"确认执行" / "取消"），2 分钟内有效，只有发起者本人或管理员可以点击确认；`wake`/`status` 无副作用风险，直接执行。确认点击本身不再经过模型（`handle_confirmation_callback` 直接执行），这也是为什么休眠 LLM 所在机器是安全的——不存在"执行到一半模型被掐断"的时序问题。
+- **LLM 所在机器（`win-8`）的提示而非拦截**：休眠它或 `sleep all` 时，确认提示和执行结果里都会带一句"休眠后模型对话暂时不可用，需重新唤醒"的说明，但不会拦截操作。
+- **模型不可达时的关键词兜底**：每条消息处理前先探活 LiteLLM（`is_host_reachable()`，2 秒 TCP 超时）；探活失败就跳过模型，改用 `parse_intent()` 做保守的关键词匹配（唤醒/休眠/状态 + 机器名/全部），直接执行同一个 `dispatch_tool_call()`。识别不到就提示用户改用 `/wake` `/sleep` 命令，不会瞎猜目标。这条路径专门解决"模型所在机器睡着了，没法用自然语言把它叫醒"的鸡生蛋问题。
 - **审计日志**：每次工具调用（无论执行、拒绝还是待确认）都记录到 `bot.log`，包含 `telegram_user_id`、`action`、`target`、执行结果。
 - **原始输出透传**：`hm` 脚本的原始 stdout 会直接发给 Telegram 用户（而不是只让模型转述），保证"设备到底发生了什么"有可核对的真实来源。
 

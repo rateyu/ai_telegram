@@ -1,17 +1,28 @@
 """Home-machine power control tool, invokable either as an LLM function-call or a deterministic
-Telegram command. Both paths share dispatch_tool_call() so auth, self-host protection and
-confirmation rules only live in one place.
+Telegram command. Both paths share dispatch_tool_call() so auth and confirmation rules only
+live in one place.
 """
 
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
 logger = logging.getLogger("telegram-litellm-bot.tools")
 
 ACTIONS = ("wake", "sleep", "status")
+
+# Fallback keyword intent, used only when the LiteLLM backend itself is unreachable (e.g. its
+# host machine is asleep) — there is no model available to do tool-calling in that state, so a
+# natural-language wake request has to be recognized without one.
+_ACTION_KEYWORDS = {
+    "wake": ("唤醒", "叫醒", "开机", "打开电脑", "wake", "power on", "turn on"),
+    "sleep": ("休眠", "睡眠", "关机", "睡了", "sleep", "suspend", "hibernate", "shutdown", "turn off"),
+    "status": ("状态", "在线吗", "在不在", "status", "online"),
+}
+_ALL_KEYWORDS = ("all", "全部", "所有", "全都", "都")
 
 
 @dataclass(frozen=True)
@@ -51,8 +62,9 @@ def load_machine_names(machines_config_path: str) -> list[str]:
 def resolve_self_host_machine(machines_config_path: str, litellm_base_url: str) -> str | None:
     """Return the machine name whose IP matches the LiteLLM backend host, if any.
 
-    Waking/sleeping this machine through itself is unsafe: a sleep command can cut the
-    connection the bot's own model inference depends on mid-request.
+    Used only to add a heads-up note when this machine is targeted — sleeping it makes the
+    LiteLLM backend unreachable until it's woken again, so LLM tool-calling won't work in the
+    meantime (see is_host_reachable() / parse_intent() for the deterministic fallback).
     """
     host = urlparse(litellm_base_url).hostname
     if not host:
@@ -65,6 +77,61 @@ def resolve_self_host_machine(machines_config_path: str, litellm_base_url: str) 
     for name, cfg in data.get("machines", {}).items():
         if cfg.get("ip") == host:
             return name
+    return None
+
+
+async def is_host_reachable(base_url: str, timeout: float = 2.0) -> bool:
+    """Quick TCP reachability check for the LiteLLM backend host:port.
+
+    Used to decide routing: if this fails, there is no point sending a chat completion
+    request (it would just time out), so natural-language power commands fall back to a
+    deterministic keyword parse instead of LLM tool-calling.
+    """
+    parsed = urlparse(base_url)
+    host = parsed.hostname
+    if not host:
+        return False
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
+    except (OSError, asyncio.TimeoutError):
+        return False
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except OSError:
+        pass
+    return True
+
+
+def _normalize(text: str) -> str:
+    return re.sub(r"[-_\s]", "", text).lower()
+
+
+def parse_intent(text: str, machine_names: list[str]) -> tuple[str, str] | None:
+    """Best-effort deterministic action+target parse from free text.
+
+    Only used as a fallback when the LLM backend is unreachable. Deliberately conservative:
+    returns None (no confident match) rather than guessing a target, since a false positive
+    on 'sleep' would put up a real confirmation prompt for something the user didn't mean.
+    """
+    normalized_text = _normalize(text)
+
+    action = None
+    for candidate_action, keywords in _ACTION_KEYWORDS.items():
+        if any(_normalize(k) in normalized_text for k in keywords):
+            action = candidate_action
+            break
+    if action is None:
+        return None
+
+    if any(_normalize(k) in normalized_text for k in _ALL_KEYWORDS):
+        return action, "all"
+
+    for name in machine_names:
+        if _normalize(name) in normalized_text:
+            return action, name
+
     return None
 
 
@@ -166,55 +233,29 @@ async def dispatch_tool_call(
     if target_error:
         return ToolCallOutcome(ok=False, summary=target_error)
 
-    if action == "sleep" and target == self_host_machine:
-        logger.warning(
-            "tool_call REJECTED (self-host sleep) target=%s user=%s", target, telegram_user_id
-        )
-        return ToolCallOutcome(
-            ok=False,
-            summary=(
-                f"拒绝执行：{target} 是当前 LLM 推理服务所在的机器，"
-                "通过它自己下发睡眠指令有掐断当前对话链路的风险，请手动处理。"
-            ),
-        )
-
     if action == "sleep" and not confirmed:
-        logger.info("tool_call PENDING_CONFIRMATION action=%s target=%s user=%s", action, target, telegram_user_id)
+        logger.info(
+            "tool_call PENDING_CONFIRMATION action=%s target=%s user=%s", action, target, telegram_user_id
+        )
         return ToolCallOutcome(ok=True, summary="该操作需要用户二次确认后才会执行。", needs_confirmation=True)
 
-    excluded_self_host = False
-    if action == "sleep" and target == "all" and self_host_machine in machine_names:
-        run_targets = [m for m in machine_names if m != self_host_machine]
-        excluded_self_host = True
-    else:
-        run_targets = [target]
-
-    lines = []
-    all_ok = True
-    for t in run_targets:
-        result = await run_hm_command(settings, action, t)
-        all_ok = all_ok and result.ok
-        logger.info(
-            "hm_command action=%s target=%s ok=%s output=%r error=%r",
-            action, t, result.ok, result.output[:500], result.error,
-        )
-        status = "成功" if result.ok else "失败"
-        body = result.output or result.error or ""
-        lines.append(f"{t}: {status}\n{body}".strip())
-
-    if excluded_self_host:
-        lines.append(f"{self_host_machine}: 已跳过（LLM 推理服务所在机器，需手动处理）")
-
-    raw_output = "\n\n".join(lines)
-    summary = json.dumps(
-        {
-            "action": action,
-            "requested_target": target,
-            "executed_targets": run_targets,
-            "excluded_self_host": excluded_self_host,
-            "ok": all_ok,
-        },
-        ensure_ascii=False,
+    # Let hm's own resolve_targets() expand "all" and handle jump-host sleep ordering — that
+    # logic (sleep dependents before the jump host they tunnel through) already lives there.
+    result = await run_hm_command(settings, action, target)
+    logger.info(
+        "hm_command action=%s target=%s ok=%s output=%r error=%r",
+        action, target, result.ok, result.output[:500], result.error,
     )
 
-    return ToolCallOutcome(ok=all_ok, summary=summary, user_message=raw_output)
+    user_message = result.output or result.error or ""
+    hits_self_host = self_host_machine and (target == self_host_machine or target == "all")
+    if action == "sleep" and hits_self_host and self_host_machine in machine_names:
+        user_message += (
+            f"\n\n提示：{self_host_machine} 是当前 LLM 推理服务所在机器，休眠后模型对话会暂时不可用，"
+            f"可以用 /wake {self_host_machine} 或直接说“唤醒 {self_host_machine}”重新唤醒它。"
+        )
+
+    summary = json.dumps(
+        {"action": action, "target": target, "ok": result.ok}, ensure_ascii=False
+    )
+    return ToolCallOutcome(ok=result.ok, summary=summary, user_message=user_message)

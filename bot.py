@@ -445,6 +445,12 @@ async def send_confirmation_prompt(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, token: str, action: str, target: str
 ) -> None:
     action_zh = {"sleep": "休眠", "wake": "唤醒", "status": "查询状态"}.get(action, action)
+    text = f"即将对 {target} 执行「{action_zh}」，请确认（2 分钟内有效）："
+    if action == "sleep" and self_host_machine and target in (self_host_machine, "all"):
+        text += (
+            f"\n⚠️ 包含 {self_host_machine}（当前 LLM 推理服务所在机器），休眠后模型对话会暂时"
+            f"不可用，需要用 /wake {self_host_machine} 或关键词唤醒它才能恢复。"
+        )
     keyboard = InlineKeyboardMarkup(
         [
             [
@@ -453,11 +459,7 @@ async def send_confirmation_prompt(
             ]
         ]
     )
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"即将对 {target} 执行「{action_zh}」，请确认（2 分钟内有效）：",
-        reply_markup=keyboard,
-    )
+    await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
 
 
 async def run_tool_call_loop(
@@ -537,6 +539,40 @@ async def ask_litellm(
     return answer or "模型返回了空内容，请稍后重试或增加 MAX_MODEL_TOKENS。"
 
 
+async def handle_message_without_llm(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str, chat_id: int, user_id: int
+) -> None:
+    """Deterministic keyword fallback used when the LiteLLM backend is unreachable — there's no
+    model available to do tool-calling, but a wake request is exactly what's needed to fix that.
+    """
+    intent = hm_tools.parse_intent(prompt, machine_names)
+    if intent is None:
+        await update.effective_message.reply_text(
+            "当前连不上 LiteLLM 模型服务（可能是 "
+            f"{self_host_machine or '推理服务所在机器'} 处于休眠状态），暂时无法正常对话。\n"
+            f"可以用命令直接唤醒：/wake {self_host_machine or 'all'}，"
+            "或者说“唤醒 win-8”这类简单关键词，我会直接处理，不需要模型。"
+        )
+        return
+
+    action, target = intent
+    if not hm_tools.is_authorized(tools_settings, user_id):
+        await update.effective_message.reply_text(
+            "模型服务当前不可用，识别到你想执行电源操作，但你没有权限直接执行。"
+        )
+        return
+
+    if action == "sleep":
+        token = register_pending_confirmation(chat_id, user_id, action, target)
+        await send_confirmation_prompt(context, chat_id, token, action, target)
+        return
+
+    outcome = await hm_tools.dispatch_tool_call(
+        tools_settings, action, target, user_id, machine_names, self_host_machine
+    )
+    await reply_long_text(update, outcome.user_message or outcome.summary)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not should_answer(update, context):
         return
@@ -548,6 +584,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
+
+    if not await hm_tools.is_host_reachable(settings.litellm_base_url):
+        await handle_message_without_llm(update, context, prompt, chat_id, user_id)
+        return
+
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
     try:
