@@ -4,25 +4,16 @@
 
 ## 更新日志
 
-- 2026-08-04：新增家庭设备电源控制（wake/sleep/status），基于 `~/github/homemachines/home_machines.py`（即 `hm` 命令）。提供两条入口：
-  - LLM tool-calling：自然语言（"把电脑都叫醒" "该睡了"）由模型判断是否调用 `home_machine_control` 工具。
-  - 确定性命令：`/wake [机器名|all]`、`/sleep [机器名|all]`，不经过模型，直接执行，作为可靠兜底。
-  - 两条路径共用同一个 `tools.py::dispatch_tool_call()`，统一做管理员白名单鉴权、目标校验、`sleep` 二次确认（Telegram inline button）、审计日志。
-  - 自保护：LiteLLM/llama.cpp 后端所在的机器（当前是 `win-8`，从 `LITELLM_BASE_URL` 自动识别）在 `sleep` 前会有专门提示（见下方 08-04 第二条更新，现已支持休眠它本身）。
-  - 详见下方「家庭设备电源控制」一节。
-  - **使用说明**：
-    1. 启用前必须在 `.env` 填 `TELEGRAM_ADMIN_USER_IDS`（问 @userinfobot 拿自己的 Telegram 数字 user id），留空则功能整体禁用；改完 `.env` 用 `scripts/restart_bot.sh` 重启生效。
-    2. 自然语言方式：私聊或群聊里直接说"帮我把电脑都叫醒"、"win-66 在线吗"、"该睡了，都休眠吧"，模型会判断是否调用 `home_machine_control` 工具，非管理员发起会被直接拒绝。
-    3. 确定性命令方式：`/wake all`（或 `/wake win-8` 指定单台）唤醒，立即执行；`/sleep all`（或 `/sleep linux-1153`）休眠。
-    4. `sleep` 无论来自自然语言还是命令，都会先收到一条带「✅ 确认执行 / ❌ 取消」按钮的消息，2 分钟内点击确认才真正执行，只有发起人本人或管理员能点；不确认会自动过期。
-    5. 执行后机器人会把 `hm` 脚本的原始输出直接发回聊天（每台机器一段"成功/失败 + 详情"），可直接核对真实结果，不必只信模型的转述。
-    6. `win-8`（LLM 推理服务所在机器）现在和其他机器一样支持 `wake`/`sleep`；对它或 `sleep all` 执行休眠时，确认按钮和执行结果里都会带一句提示：休眠后模型对话会暂时不可用，需要重新唤醒它。
+按提交时间倒序，每条对应一个 git commit（`git log --oneline` 可查完整历史）。详细用法见下方「家庭设备电源控制」一节，这里只记录变了什么、为什么变。
 
-- 2026-08-04（续）：`win-8` 支持休眠 + LiteLLM 不可达时的关键词兜底。
-  - 不再拒绝对 `win-8` 下发 `sleep`（原先的自保护是硬拒绝）。因为 `sleep` 的确认点击本来就不经过模型（`handle_confirmation_callback` 直接执行，不需要再调一次 LLM），所以休眠它本身其实是安全的，只是会警告"休眠后模型暂时不可用"。
-  - `sleep all` 不再手动排除 `win-8`，改成把 `target="all"` 原样交给 `hm` 自己处理——这样也顺带修复了一个隐患：之前逐台循环调用会跳过 `home_machines.py` 里"先睡 jump host 后面的机器，再睡 jump host 本身"的顺序保护；现在统一交给 `hm` 一次调用，顺序由它自己保证。
-  - **关键场景**：如果 `win-8` 睡着了，LiteLLM 就连不上，模型自然也没法做 tool-calling——这时候想用自然语言让机器人"唤醒 win-8"会卡死在等模型响应。现在 `handle_message` 每次都会先用 `tools.py::is_host_reachable()` 做一次到 LiteLLM 的 TCP 探活（2 秒超时）：连不上就跳过模型，改用 `tools.py::parse_intent()` 做关键词兜底解析（"唤醒/叫醒/开机" "休眠/睡眠/关机" "状态/在线" + 机器名或"全部/都"），直接走 `dispatch_tool_call()` 执行；识别不到就提示"模型不可用，请用 /wake win-8 或说'唤醒 win-8'"。这样即使模型所在的机器睡着了，也能单靠关键词把它叫醒，不依赖它自己。
-  - 兜底解析故意保守：没匹配到明确目标就返回"未识别"而不是猜一个，避免闲聊里出现"我都不知道"之类的词被误判成 `sleep all`。
+- **`be8684f`** 2026-08-04 — `win-8` 支持休眠 + LiteLLM 不可达时的关键词兜底
+  - 不再硬拒绝对 `win-8`（LLM 推理服务所在机器）下发 `sleep`。原先的自保护假设"确认后还要模型再总结一次"，但实际上 `sleep` 的确认点击本来就不经过模型（回调直接执行），所以休眠它本身是安全的，现在只保留一句提示。
+  - `sleep all` 不再手动排除 `win-8`、逐台循环调用，改成把 `target="all"` 原样交给 `hm` 处理——顺带修掉一个隐患：逐台调用会跳过 `home_machines.py` 里"先睡 jump host 后面的机器、再睡 jump host 本身"的顺序保护，现在这个顺序由 `hm` 自己统一保证。
+  - 新增 `is_host_reachable()`（2 秒 TCP 探活）+ `parse_intent()`（保守的中英文关键词解析）：模型所在机器睡着、LiteLLM 连不上时，自然语言消息自动降级为关键词直接执行，不再依赖一个连不上的模型才能把它叫醒。
+- **`597a33c`** 2026-08-04 — 补充电源控制功能的使用步骤到文档
+- **`686ca3a`** 2026-08-04 — 新增家庭设备电源控制（wake/sleep/status）
+  - 基于 `~/github/homemachines/home_machines.py`（`hm` 命令）新增两条触发入口：LLM tool-calling（自然语言）+ `/wake` `/sleep` 确定性命令，共用 `tools.py::dispatch_tool_call()` 做鉴权、校验、二次确认、审计日志。
+- **`20d501f`** 及更早 — 见 `git log`，主要是首次提交和稳定性/重启流程加固，与电源控制功能无关。
 
 ## 运行前提
 
@@ -149,6 +140,24 @@ HM_SCRIPT_PATH=/Users/myu/github/homemachines/home_machines.py
 HM_MACHINES_CONFIG=/Users/myu/github/homemachines/machines.json
 HM_PYTHON_BIN=            # 留空则用机器人自己的 venv python（home_machines.py 只依赖标准库，够用）
 HM_COMMAND_TIMEOUT_SECONDS=150
+```
+
+### 使用步骤
+
+1. 在 `.env` 填 `TELEGRAM_ADMIN_USER_IDS`（问 @userinfobot 拿自己的 Telegram 数字 user id），留空则功能整体禁用；改完 `.env` 后用 `scripts/restart_bot.sh` 重启生效。
+2. 自然语言方式：私聊或群聊里直接说"帮我把电脑都叫醒"、"win-66 在线吗"、"该睡了，都休眠吧"，模型会判断是否调用 `home_machine_control` 工具，非管理员发起会被直接拒绝。
+3. 确定性命令方式：`/wake all`（或 `/wake win-8` 指定单台）唤醒，立即执行；`/sleep all`（或 `/sleep linux-1153`）休眠。
+4. `sleep` 无论来自自然语言、命令还是关键词兜底，都会先收到一条带「✅ 确认执行 / ❌ 取消」按钮的消息，2 分钟内点击确认才真正执行，只有发起人本人或管理员能点；不确认会自动过期。
+5. 执行后机器人会把 `hm` 脚本的原始输出直接发回聊天，可直接核对真实结果，不必只信模型转述。
+
+**测试 `win-8` 休眠 + 关键词兜底唤醒的完整链路：**
+
+```text
+你：/sleep win-8                      → 弹出确认按钮，带"模型暂时不可用"提示
+你：点击「✅ 确认执行」                 → win-8 开始休眠，LiteLLM 随之不可达
+你：（等几秒后）唤醒 win-8              → 这条消息发出前机器人会先探活 LiteLLM 失败，
+                                         自动降级为关键词解析，不经过模型直接发送 WOL
+你：（win-8 上线、LiteLLM 起来后）问点别的 → 探活恢复成功，自动切回正常的模型对话
 ```
 
 ### 安全设计
