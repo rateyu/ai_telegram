@@ -46,6 +46,7 @@ MAX_REPLY_CHARS=3900
 MAX_MODEL_TOKENS=512
 REQUEST_RETRIES=2
 RETRY_BACKOFF_SECONDS=2
+MODEL_LIST_CACHE_SECONDS=300
 ```
 
 如果当前网络可以直连 Telegram，可以留空 `TELEGRAM_PROXY_URL`。使用 Shadowrocket 时，本机代理端口通常类似 `http://127.0.0.1:1082`。
@@ -117,7 +118,7 @@ tail -n 120 bot.log
 
 - 私聊机器人：直接发送消息。
 - 群聊：回复机器人的消息，或使用 `/ask 你的问题`。
-- `/model` 查看当前 LiteLLM 接口地址和模型名。
+- `/model` 查看/切换当前对话使用的模型（按钮选择，见下方「多模型选择」一节）；也支持 `/model <名称>` 和 `/model refresh`。
 - `/health` 检查机器人到 LiteLLM 模型链路是否正常。
 - `/reset` 清空当前聊天上下文。
 - `/wake [机器名|all]` 唤醒家庭设备（仅管理员，默认 `all`）。
@@ -169,6 +170,31 @@ HM_COMMAND_TIMEOUT_SECONDS=150
 - **模型不可达时的关键词兜底**：每条消息处理前先探活 LiteLLM（`is_host_reachable()`，2 秒 TCP 超时）；探活失败就跳过模型，改用 `parse_intent()` 做保守的关键词匹配（唤醒/休眠/状态 + 机器名/全部），直接执行同一个 `dispatch_tool_call()`。识别不到就提示用户改用 `/wake` `/sleep` 命令，不会瞎猜目标。这条路径专门解决"模型所在机器睡着了，没法用自然语言把它叫醒"的鸡生蛋问题。
 - **审计日志**：每次工具调用（无论执行、拒绝还是待确认）都记录到 `bot.log`，包含 `telegram_user_id`、`action`、`target`、执行结果。
 - **原始输出透传**：`hm` 脚本的原始 stdout 会直接发给 Telegram 用户（而不是只让模型转述），保证"设备到底发生了什么"有可核对的真实来源。
+
+## 多模型选择
+
+机器人不在代码里写死可选模型列表，而是每次调用 LiteLLM 的 `GET /v1/models`（OpenAI 兼容接口）实时拿它当前暴露的模型集合，带一个短 TTL 缓存。换句话说：**在 LiteLLM 侧加一个模型（`config.yaml` 新增一条 `model_name` + reload），Telegram 这边立刻就能选，不需要改 `ai_telegram` 代码、不需要重新部署机器人。**
+
+### 使用
+
+- `/model` — 弹出按钮列表（当前选中的带 ✅），点按钮即可切换。
+- `/model <名称>` — 直接切换到指定模型（名称需在 `/v1/models` 返回的列表里）。
+- `/model refresh` — 强制刷新一次列表缓存（刚在 LiteLLM 加了新模型、还没到缓存过期时间时用）。
+
+模型选择按 Telegram chat 独立记忆（存在进程内存里，重启后回到 `LITELLM_MODEL` 默认值），不同群/不同私聊可以各选各的模型，互不影响；对话上下文（`chat_histories`）不随模型切换清空，切换后历史消息照常带入下一次请求。
+
+### 配置
+
+```env
+# 缓存 LiteLLM /v1/models 列表的秒数，过期后 /model 会自动重新拉取一次。
+MODEL_LIST_CACHE_SECONDS=300
+```
+
+### 和电源控制、win-8 兜底的关系
+
+`home_machine_control` 这个 tool 的 schema 对所有模型一视同仁——只要选中的模型支持 OpenAI 风格的 function calling，"唤醒 win-8"这类自然语言在任何模型下都能触发同一个 `dispatch_tool_call()`。
+
+目前 LiteLLM 本身仍然跑在 `win-8` 上，所以**不管当前选的是哪个模型**，只要 `win-8` 关机，所有模型都会一起不可达——`is_host_reachable()` 探活的是 `LITELLM_BASE_URL` 这一个地址，不区分模型。这种情况下仍然走关键词兜底（见「家庭设备电源控制」一节）来唤醒 `win-8`，等它和 LiteLLM 恢复后再自动切回正常对话。等 LiteLLM 迁移到常驻服务器后，这层探活/兜底就不再必要，但目前先保留。
 
 ## 常见问题
 

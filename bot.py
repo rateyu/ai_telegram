@@ -64,6 +64,7 @@ class Settings:
     hm_python_bin: str
     hm_machines_config: str
     hm_command_timeout_seconds: float
+    model_list_cache_seconds: float
 
 
 def parse_admin_ids(value: str | None) -> frozenset[int]:
@@ -111,6 +112,7 @@ def load_settings() -> Settings:
             "HM_MACHINES_CONFIG", "/Users/myu/github/homemachines/machines.json"
         ).strip(),
         hm_command_timeout_seconds=float(os.getenv("HM_COMMAND_TIMEOUT_SECONDS", "150")),
+        model_list_cache_seconds=float(os.getenv("MODEL_LIST_CACHE_SECONDS", "300")),
     )
 
 
@@ -153,6 +155,38 @@ if not machine_names:
         "No machines loaded from %s; home machine power control tool has no valid targets.",
         settings.hm_machines_config,
     )
+
+# Per-chat model selection. Models themselves are not hardcoded here — they're whatever LiteLLM
+# currently exposes on /v1/models, so adding a model on the LiteLLM side (a config.yaml entry +
+# reload) shows up here with no bot deploy required. Selection lives in memory only, same as
+# chat_histories / pending_confirmations, and resets to the default on bot restart.
+chat_model_selection: dict[int, str] = {}
+_model_list_cache: list[str] = []
+_model_list_cache_at: float = 0.0
+
+
+async def list_available_models(force: bool = False) -> list[str]:
+    """Fetch the model names LiteLLM currently serves, with a short TTL cache.
+
+    Falls back to the last known-good list (or the configured default) if LiteLLM/its backend
+    is unreachable, so /model still shows something useful during a win-8-down window instead
+    of erroring out.
+    """
+    global _model_list_cache, _model_list_cache_at
+    if not force and _model_list_cache and time.monotonic() - _model_list_cache_at < settings.model_list_cache_seconds:
+        return _model_list_cache
+    try:
+        response = await client.models.list()
+        names = sorted(m.id for m in response.data)
+        if names:
+            _model_list_cache, _model_list_cache_at = names, time.monotonic()
+    except Exception:
+        logger.warning("list_available_models: fetch failed, using cached/default list", exc_info=True)
+    return _model_list_cache or [settings.litellm_model]
+
+
+def get_active_model(chat_id: int) -> str:
+    return chat_model_selection.get(chat_id, settings.litellm_model)
 
 
 @dataclass
@@ -253,7 +287,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "/ask 问题 - 在群聊中向我提问\n"
-        "/model - 查看当前 LiteLLM 连接配置\n"
+        "/model - 查看/切换当前对话使用的模型（按钮选择）\n"
+        "/model <名称> - 直接切换到指定模型\n"
+        "/model refresh - 强制刷新模型列表\n"
         "/health - 检查 LiteLLM 模型链路\n"
         "/reset - 清空当前聊天上下文\n"
         "/wake [机器名|all] - 唤醒家庭设备（仅管理员，默认 all）\n"
@@ -335,11 +371,65 @@ async def handle_confirmation_callback(update: Update, context: ContextTypes.DEF
 
 
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(
-        "当前模型配置：\n"
-        f"model: {settings.litellm_model}\n"
-        f"base_url: {settings.litellm_base_url}"
+    chat_id = update.effective_chat.id
+    args = context.args or []
+
+    if args and args[0].lower() == "refresh":
+        await list_available_models(force=True)
+        args = args[1:]
+        if not args:
+            await update.effective_message.reply_text("模型列表已刷新。")
+            # fall through to show the picker below
+
+    models = await list_available_models()
+
+    if args:
+        requested = args[0]
+        if requested not in models:
+            await update.effective_message.reply_text(
+                f"未知模型: {requested}\n可用: {', '.join(models)}\n"
+                "如果是刚在 LiteLLM 加的模型，先发 /model refresh 再试。"
+            )
+            return
+        chat_model_selection[chat_id] = requested
+        await update.effective_message.reply_text(f"已切换到模型: {requested}")
+        return
+
+    current = get_active_model(chat_id)
+    context.chat_data["model_list_snapshot"] = models
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(f"✅ {name}" if name == current else name, callback_data=f"model_select:{idx}")]
+            for idx, name in enumerate(models)
+        ]
     )
+    await update.effective_message.reply_text(
+        f"当前模型：{current}\nbase_url: {settings.litellm_base_url}\n\n"
+        "点按钮切换，或直接发 /model <名称>；/model refresh 刷新列表。",
+        reply_markup=keyboard,
+    )
+
+
+async def handle_model_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    if ":" not in data:
+        return
+    _, idx_str = data.split(":", 1)
+    try:
+        idx = int(idx_str)
+    except ValueError:
+        return
+
+    models = context.chat_data.get("model_list_snapshot") or await list_available_models()
+    if idx < 0 or idx >= len(models):
+        await query.edit_message_text("该选项已过期，请重新发送 /model。")
+        return
+
+    chosen = models[idx]
+    chat_model_selection[query.message.chat_id] = chosen
+    await query.edit_message_text(f"已切换到模型: {chosen}")
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -355,7 +445,7 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     ]
 
     try:
-        await create_chat_completion_with_retries(messages)
+        await create_chat_completion_with_retries(messages, get_active_model(update.effective_chat.id))
     except APIStatusError as exc:
         await update.effective_message.reply_text(
             "模型链路异常：LiteLLM 返回错误。\n"
@@ -380,10 +470,10 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def build_completion_kwargs(
-    messages: list[dict[str, str]], tools: list[dict] | None = None
+    messages: list[dict[str, str]], model: str, tools: list[dict] | None = None
 ) -> dict[str, object]:
     kwargs: dict[str, object] = {
-        "model": settings.litellm_model,
+        "model": model,
         "messages": messages,
     }
     if settings.max_model_tokens:
@@ -404,14 +494,14 @@ def should_retry_api_error(exc: APIStatusError) -> bool:
 
 
 async def create_chat_completion_with_retries(
-    messages: list[dict[str, str]], tools: list[dict] | None = None
+    messages: list[dict[str, str]], model: str, tools: list[dict] | None = None
 ):
     last_error: Exception | None = None
     attempts = settings.request_retries + 1
 
     for attempt in range(attempts):
         try:
-            return await client.chat.completions.create(**build_completion_kwargs(messages, tools))
+            return await client.chat.completions.create(**build_completion_kwargs(messages, model, tools))
         except APIStatusError as exc:
             last_error = exc
             if not should_retry_api_error(exc) or attempt == attempts - 1:
@@ -467,12 +557,13 @@ async def run_tool_call_loop(
     chat_id: int,
     telegram_user_id: int,
     messages: list[dict[str, object]],
+    model: str,
 ) -> str | None:
     """Run a bounded LLM tool-calling loop. Returns the final assistant text, or None if a
     confirmation prompt was already sent to the chat and nothing more should be said.
     """
     for _ in range(TOOL_MAX_ROUNDS):
-        response = await create_chat_completion_with_retries(messages, tools=[TOOL_SCHEMA])
+        response = await create_chat_completion_with_retries(messages, model, tools=[TOOL_SCHEMA])
         choice_message = response.choices[0].message
         tool_calls = choice_message.tool_calls or []
 
@@ -529,7 +620,8 @@ async def ask_litellm(
     messages.extend(history)
     messages.append({"role": "user", "content": prompt})
 
-    answer = await run_tool_call_loop(context, chat_id, telegram_user_id, messages)
+    model = get_active_model(chat_id)
+    answer = await run_tool_call_loop(context, chat_id, telegram_user_id, messages, model)
     if answer is None:
         # A confirmation prompt was already sent; nothing more to say for this turn.
         return None
@@ -652,7 +744,8 @@ async def post_init(application: Application) -> None:
             [
                 {"role": "system", "content": "只返回 OK。"},
                 {"role": "user", "content": "健康检查"},
-            ]
+            ],
+            settings.litellm_model,
         )
         logger.info("LiteLLM health check passed")
     except Exception:
@@ -674,6 +767,9 @@ def main() -> None:
     application.add_handler(CommandHandler("ask", handle_message))
     application.add_handler(
         CallbackQueryHandler(handle_confirmation_callback, pattern=r"^hm_(confirm|cancel):")
+    )
+    application.add_handler(
+        CallbackQueryHandler(handle_model_selection_callback, pattern=r"^model_select:")
     )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_error_handler(error_handler)
