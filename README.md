@@ -6,6 +6,14 @@
 
 按提交时间倒序，每条对应一个 git commit（`git log --oneline` 可查完整历史）。详细用法见下方「家庭设备电源控制」「多模型选择」两节，这里只记录变了什么、为什么变。
 
+- **`cb42056`** 2026-08-08 — 修复 `restart_bot.sh` 的进程清理与失败处理
+  - 进程匹配从"命令行里包含 ` bot.py`"的宽松子串匹配，改成 `pgrep -f` 精确匹配本项目 `.venv` 启动的完整命令行，避免误杀同名 `bot.py` 但属于其他项目的进程。
+  - 两轮清理不再都发 `SIGTERM`（第二次和第一次等价、卡死进程杀不掉）：第一轮 `SIGTERM` 优雅退出，2 秒后仍在则 `SIGKILL` 强杀。
+  - `kill` 调用补上 `|| true`：脚本用了 `set -e`，之前如果目标进程在 `ps` 快照后自己退出，`kill` 返回非0会导致整个脚本中途异常终止，启动逻辑压根不会跑。
+  - 45 秒内没等到 "Application started" 时补上 `exit 1`（原来会以 0 退出，外部监控/cron 看不出启动失败)。
+  - 运行期 plist 从共享的 `/tmp/${LABEL}.plist` 改成写到项目目录 `scripts/.${LABEL}.runtime.plist`（已加入 `.gitignore`），避免多用户机器上被其他人读到或被系统清理 `/tmp` 时误删。
+  - 删掉未使用的 `PYTHON` 变量。
+  - **必须用 `./scripts/restart_bot.sh` 或 `zsh scripts/restart_bot.sh` 执行，不能用 `sh scripts/restart_bot.sh`**——脚本用了进程替换 `<(...)` 等 zsh/bash 专属语法，`sh` 会忽略 shebang 按 POSIX 模式解释，报 `syntax error near unexpected token '<'`。
 - **`05dfd17`** 2026-08-08 — 新增 `/model` 动态多模型选择
   - 模型列表不再写死在代码里：`list_available_models()` 实时拉取 LiteLLM 的 `GET /v1/models`（带 TTL 缓存），LiteLLM 侧加模型（`config.yaml` + reload）即可在 `/model` 选到，不需要改 `ai_telegram` 代码或重新部署。
   - `/model` 弹按钮列表切换、`/model <名称>` 直接切换、`/model refresh` 强刷缓存；选择按 chat 记忆在内存里，重启回到默认模型。
@@ -98,10 +106,20 @@ curl http://192.168.0.8:4000/v1/chat/completions \
 日常运行使用重启脚本，脚本会先停止已有实例，再通过 macOS `launchd` 启动唯一一个机器人进程：
 
 ```bash
-scripts/restart_bot.sh
+./scripts/restart_bot.sh
 ```
 
+> 脚本用了 zsh/bash 专属语法（进程替换等），必须让 shebang 生效，即用 `./scripts/restart_bot.sh` 或 `zsh scripts/restart_bot.sh` 执行；**不要**用 `sh scripts/restart_bot.sh`，会因为 POSIX 模式不支持相关语法而报语法错误。
+
 日志写入 `bot.log`，当前进程 ID 写入 `bot.pid`。这两个文件只用于本地运行，已在 `.gitignore` 中忽略。
+
+只停止、不重启，直接用 `launchctl`：
+
+```bash
+launchctl bootout gui/$(id -u)/com.myu.ai-telegram-bot
+```
+
+`plist` 里 `KeepAlive=true`，直接 `kill` 进程会被 launchd 自动拉起，必须先 `bootout` 卸载任务再杀进程（重启脚本已经这样做了）。
 
 开发调试时也可以前台运行：
 
