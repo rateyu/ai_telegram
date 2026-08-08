@@ -4,8 +4,12 @@
 
 ## 更新日志
 
-按提交时间倒序，每条对应一个 git commit（`git log --oneline` 可查完整历史）。详细用法见下方「家庭设备电源控制」一节，这里只记录变了什么、为什么变。
+按提交时间倒序，每条对应一个 git commit（`git log --oneline` 可查完整历史）。详细用法见下方「家庭设备电源控制」「多模型选择」两节，这里只记录变了什么、为什么变。
 
+- **`05dfd17`** 2026-08-08 — 新增 `/model` 动态多模型选择
+  - 模型列表不再写死在代码里：`list_available_models()` 实时拉取 LiteLLM 的 `GET /v1/models`（带 TTL 缓存），LiteLLM 侧加模型（`config.yaml` + reload）即可在 `/model` 选到，不需要改 `ai_telegram` 代码或重新部署。
+  - `/model` 弹按钮列表切换、`/model <名称>` 直接切换、`/model refresh` 强刷缓存；选择按 chat 记忆在内存里，重启回到默认模型。
+  - 请求路径（`create_chat_completion_with_retries` 等）从写死 `settings.litellm_model` 改成显式传 `model` 参数；`home_machine_control` tool 和 win-8 不可达时的关键词兜底不受影响、未删除——LiteLLM 目前仍在 `win-8` 上，所有模型共享同一个探活地址。
 - **`be8684f`** 2026-08-04 — `win-8` 支持休眠 + LiteLLM 不可达时的关键词兜底
   - 不再硬拒绝对 `win-8`（LLM 推理服务所在机器）下发 `sleep`。原先的自保护假设"确认后还要模型再总结一次"，但实际上 `sleep` 的确认点击本来就不经过模型（回调直接执行），所以休眠它本身是安全的，现在只保留一句提示。
   - `sleep all` 不再手动排除 `win-8`、逐台循环调用，改成把 `target="all"` 原样交给 `hm` 处理——顺带修掉一个隐患：逐台调用会跳过 `home_machines.py` 里"先睡 jump host 后面的机器、再睡 jump host 本身"的顺序保护，现在这个顺序由 `hm` 自己统一保证。
